@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://rungent.github.io/</loc></url>
+  <url><loc>https://rungent.github.io/docs/</loc></url>
+  <url><loc>https://rungent.github.io/docs/architecture/</loc></url>
+  <url><loc>https://rungent.github.io/docs/getting-started/</loc></url>
+  <url><loc>https://rungent.github.io/docs/python-api/</loc></url>
+  <url><loc>https://rungent.github.io/docs/fastapi/</loc></url>
+  <url><loc>https://rungent.github.io/docs/mcp/</loc></url>
+  <url><loc>https://rungent.github.io/docs/external-agents/</loc></url>
+  <url><loc>https://rungent.github.io/docs/interactions/</loc></url>
+  <url><loc>https://rungent.github.io/docs/persistence/</loc></url>
+  <url><loc>https://rungent.github.io/docs/frontend/</loc></url>
+  <url><loc>https://rungent.github.io/docs/baseline/</loc></url>
+  <url><loc>https://rungent.github.io/docs/roasea/</loc></url>
+  <url><loc>https://rungent.github.io/docs/ai-reference/</loc></url>
+</urlset>

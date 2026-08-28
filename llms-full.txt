@@ -1,0 +1,1030 @@
+# Rungent
+
+Rungent supplies the infrastructure every product assistant otherwise reimplements: typed tool
+calling, the model/tool harness loop, sessions and runs, user input, deterministic approval gates,
+streaming events, persistence ports, and baseline evaluation.
+
+## Scope
+
+Rungent deliberately does **not** include a sidecar service, skill router, configuration console, or
+styled chat interface. An application imports the Python package, defines an Agent and tools, mounts
+the optional FastAPI router and/or MCP adapter, and consumes in-app events with the TypeScript SDK.
+MCP is an in-process transport for the same tools, not a hosted Rungent cloud.
+
+## Design rules
+
+- Application code describes capabilities; Rungent owns orchestration.
+- Types generate model schemas and validate every call again at execution time.
+- Tool safety is explicit and enforced in code.
+- User clarification and operation approval are durable interactions.
+- Provider-specific model streams never cross the backend boundary.
+- Baseline behavior is testable without a real model and evaluable with one.
+
+Start with [Getting started](/docs/getting-started). AI coding agents should load
+[`/llms-full.txt`](/llms-full.txt) or read [AI reference](/docs/ai-reference).
+
+---
+
+# Architecture and trade-offs
+
+## Decision
+
+Rungent is an embedded Python runtime with optional adapters, not an agent platform. The host
+application owns authentication, business services, database transactions, prompts, tools, and UI.
+Rungent owns the model/tool loop and its externally observable lifecycle.
+
+```mermaid
+flowchart LR
+  UI["Product UI"] --> SDK["@rungent/sdk"]
+  SDK --> HTTP["FastAPI adapter"]
+  HTTP --> Runtime["Rungent Runtime"]
+  Runtime --> Model["Model adapter"]
+  Runtime --> Tools["Typed application tools"]
+  Runtime --> Store["Memory or SQLAlchemy Store"]
+  Tools --> Domain["Application services"]
+  Ext["External agent"] --> MCP["MCP adapter"]
+  MCP --> Tools
+```
+
+This boundary gives Roasea direct, typed access to its existing services without a sidecar network
+hop or duplicated authorization model. A sidecar can be added later as another transport only when
+multiple processes or languages genuinely need the same runtime.
+
+## Standardized lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> running
+  running --> running: model/tool step
+  running --> waiting_input: request_input or approval
+  waiting_input --> running: user response
+  running --> waiting_external: deferred host task
+  waiting_external --> running: trusted host completion
+  running --> completed: final assistant message
+  running --> running: transient provider retry (same model step)
+  running --> failed: exhausted provider retries or max model steps
+  running --> cancelled: cancellation
+```
+
+A session has at most one active Run. The entire Run keeps one monotonic ACS event sequence across
+pause/resume boundaries. Approvals persist a validated, normalized tool invocation; resuming cannot
+substitute new arguments. A deferred task persists its host task ID and original tool call;
+completion is trusted, terminal, and consumable exactly once.
+
+## Packages
+
+| Package | Responsibility |
+| --- | --- |
+| `rungent` | Agent definition, `@tool`, loop, interactions, ACS, model/store ports |
+| `rungent.fastapi` | Four resource-oriented endpoints and SSE transport |
+| `rungent.mcp` | Streamable HTTP MCP for the same `@tool` catalog |
+| `rungent.sqlalchemy` | Application-owned persistent store |
+| `rungent.testing` | deterministic harness tests and real-model application baselines |
+| `@rungent/sdk` | headless stream parser, client, and reducer |
+| `@rungent/docs` | human docs plus `/llms.txt`, `/llms-full.txt`, raw Markdown routes |
+
+## Deliberate omissions
+
+- No sidecar until an actual cross-process consumer requires it. `rungent.mcp` is an in-process
+  adapter, like `rungent.fastapi`.
+- No skill router; begin with one product Agent and normal typed tools. `Agent.export_skill()`
+  writes a file for an external agent and does not route inside the Runtime.
+- No styled chat component; Roasea keeps its design system and renders the headless state.
+- No provider-specific event types in the browser.
+- No prompt-based safety decisions where deterministic runtime policy can enforce them.
+- No automatic production schema creation; migrations remain application-owned.
+
+Add a new abstraction only after two real integrations need the same boundary.
+
+---
+
+# Getting started
+
+## Install
+
+```bash
+pip install "rungent[fastapi,sqlalchemy]"
+npm install @rungent/sdk
+```
+
+## Define a tool and agent
+
+```python
+from typing import Annotated
+
+from rungent import Agent, ToolContext, ToolResult, tool
+
+
+@tool(effect="write", approval="never")
+async def move_place(
+    ctx: ToolContext,
+    name: Annotated[str, "Exact place name"],
+    day_number: Annotated[int | None, "Target day; null means unplanned"],
+) -> ToolResult:
+    """Move a place to a trip day."""
+    trips = ctx.deps["trips"]
+    await trips.move(ctx.resource["trip_id"], name, day_number)
+    return ToolResult(message=f"Moved {name}")
+
+
+agent = Agent(
+    name="trip_planner",
+    instructions="""
+    You update a trip itinerary. Use a tool for every factual change.
+    Ask for input when a place or target day is ambiguous.
+    """,
+    tools=[move_place],
+)
+```
+
+The first function parameter is runtime context and is hidden from the model. Remaining typed
+parameters become JSON Schema. Rungent rejects extra fields and invalid values before execution.
+
+Continue with [Python API](/docs/python-api) and [FastAPI integration](/docs/fastapi).
+
+---
+
+# Python API
+
+## Agent
+
+An `Agent` is an immutable definition containing instructions, tools, optional dynamic context and
+public run-activity providers, and an optional model override.
+
+```python
+agent = Agent(
+    name="trip_planner",
+    instructions="Use tools to update the trip.",
+    tools=[add_place, move_place, remove_day],
+    context=trip_snapshot,
+    run_activity=describe_run,
+)
+```
+
+The context provider runs before every model step so the model sees current application state:
+
+```python
+async def trip_snapshot(ctx: ToolContext) -> str:
+    return await ctx.deps["trips"].snapshot(ctx.resource["trip_id"])
+```
+
+`ctx.current_input` is the accepted input for the current Run. Use it when a host-owned ingestion
+job needs the original text without asking the model to echo it into tool arguments.
+
+Latency-sensitive applications can describe observable work before the provider emits its first
+event. The callback is deterministic host code, not another model call:
+
+```python
+async def describe_run(ctx: ToolContext, content: str) -> RunActivity:
+    return RunActivity(
+        message="Received the itinerary; extracting its days and places",
+        waiting_message="Generating the itinerary structure; no changes have been written",
+        long_wait_message="Still organizing the detailed itinerary; the resource is unchanged",
+        continuation_message="Preparing the result",
+        public={"stage": "extracting_itinerary"},
+    )
+```
+
+Rungent persists the initial activity immediately. If the model stream is silent, it updates that
+same activity after three seconds and every five seconds thereafter. The two intervals are
+configurable on `Runtime` for deterministic tests. Once the model step advances, the activity is
+completed; real tool progress should then use `ToolContext.report_progress`.
+`model_step_timeout_seconds` bounds each provider attempt;
+`model_step_total_timeout_seconds` optionally bounds all retries in that model step.
+
+An optional `Agent.run_initializer(ctx, content)` may return one registered `ToolCall` before the
+first model step. Use it only for deterministic application routing such as an obvious pasted
+itinerary; returning `None` preserves the normal model path.
+
+## Tool
+
+`@tool` accepts:
+
+| Option | Values | Meaning |
+| --- | --- | --- |
+| `effect` | `read`, `write`, `destructive`, `external` | Audit and scheduling classification |
+| `approval` | `never`, `always` | Deterministic execution gate |
+| `title` | string | User-facing operation title |
+| `timeout_seconds` | number | Hard execution timeout |
+| `parallel` | boolean | Reserved for explicitly independent reads |
+| `deduplicate` | boolean | Skip equivalent successful non-read calls in one Run; default `true` |
+| `requires_interaction_response` | boolean | Expose only after a real user answer and consume that answer once |
+
+Use `Annotated`, `Literal`, Enum, unions, and Pydantic models to describe arguments. Tool results are
+structured:
+
+```python
+return ToolResult(
+    data={"stop_id": stop.id},      # visible to the model
+    message="Added Tokyo Tower",    # safe progress text
+    public={"resource": "trip"},   # optional frontend payload
+)
+```
+
+When a host-owned task must wait for browser or worker observations, return a durable task instead
+of holding the tool coroutine open:
+
+```python
+return ToolResult(
+    deferred=DeferredRequest(
+        task_id=job.id,
+        message="Waiting for route observations",
+        public={"completed": 0, "total": job.total},
+    )
+)
+```
+
+The Runtime moves the Run to `waiting_external`. Host code may call
+`report_external_progress(...)`, then completes it exactly once with
+`await runtime.resume_deferred(run_id, job.id, ToolResult(...), identity=identity, deps=deps)`.
+The original tool activity completes only then, and the next model step receives the authoritative
+result. Configure `external_task_canceller` when Run cancellation must stop the host job.
+
+Do not put database sessions or credentials into tool arguments. Put request-scoped services in
+`ctx.deps`, stable resource identifiers in `ctx.resource`, and caller identity in `ctx.identity`.
+After a non-approval interaction resumes, `ctx.interaction_response` contains the normalized,
+runtime-validated `interaction_id`, `kind`, `prompt`, and `value`. It is absent on initial runs and
+approval resumes. Host tools can bind sequential draft resolution to this value instead of
+accepting an answer copied into model-controlled tool arguments. Such tools must declare
+`requires_interaction_response=True`; the Runtime hides them until a validated answer exists and
+clears the trusted answer after the first attempted invocation.
+
+Long-running tools can publish real intermediate state without another model step:
+
+```python
+await ctx.report_progress("Matched 3 of 12 places", public={"trip_changed": True})
+```
+
+Each call becomes a persisted `activity.updated` event with the tool call's stable progress ID.
+The SDK therefore replaces one running timeline row while the event log retains every update; a
+final update settles that row when the tool succeeds or fails. Keep the message public and concise;
+`public` follows the same frontend-only contract as `ToolResult.public`.
+
+The model receives an explicit `tool_status` envelope. A normal result is `success`; a result whose
+`data.ok` is `false`, a timeout, validation failure, or exception is `error`. Only explicit success
+envelopes participate in deduplication, so a corrected retry is never suppressed by an earlier
+failure.
+Rungent normalizes arguments and suppresses a repeated successful write/destructive/external call
+with the same tool name and arguments in one Run. The duplicate receives a successful tool result
+without executing business code. Set `deduplicate=False` only when repeating the exact operation is
+intentional; prefer one batch/count argument so intent remains explicit.
+
+## Runtime
+
+```python
+runtime = Runtime(
+    agents=[agent],
+    model=OpenAICompatibleModel(
+        api_key="...",
+        base_url="https://api.openai.com/v1",
+        model="gpt-5-mini",
+    ),
+    store=SQLAlchemyStore(sessionmaker),
+    max_model_steps=16,
+    model_wait_progress_after_seconds=3,
+    model_wait_progress_interval_seconds=5,
+    model_step_timeout_seconds=60,
+    model_step_total_timeout_seconds=150,
+    external_task_canceller=cancel_host_task,
+)
+```
+
+One Runtime may register several named agents, but most applications should begin with exactly one.
+`max_model_steps` bounds the complete Run, including model calls before and after interaction
+pause/resume cycles, and defaults to 16. The persisted `Run.model_steps` makes this limit and event
+step IDs monotonic. It is separate from provider transport retries: `OpenAICompatibleModel` retries
+transient failures inside the same step.
+
+```python
+model = OpenAICompatibleModel(
+    api_key="...",
+    base_url="https://api.openai.com/v1",
+    model="gpt-5-mini",
+    max_retries=3,
+    retry_backoff_seconds=0.5,
+    extra_body={"enable_thinking": False},
+)
+```
+
+The backoff is exponential and capped at eight seconds. HTTP 400-class errors other than 408 and
+429 are not retried. Pass `extra_body` for trusted provider-specific top-level fields; it cannot
+override Rungent's core request.
+
+---
+
+# FastAPI integration
+
+```python
+from fastapi import FastAPI, Request
+
+from rungent import Identity
+from rungent.fastapi import create_router
+
+
+async def resolve_identity(request: Request) -> Identity:
+    user = await current_user(request)
+    return Identity(subject_id=user.id, tenant_id=user.tenant_id)
+
+
+async def create_context(request, session, run):
+    return {
+        "trips": request.app.state.trip_service,
+        "db_sessionmaker": request.app.state.db_sessionmaker,
+    }
+
+
+app = FastAPI()
+app.include_router(
+    create_router(
+        runtime,
+        identity_resolver=resolve_identity,
+        context_factory=create_context,
+    ),
+    prefix="/api/assistant",
+)
+```
+
+Endpoints are intentionally resource-oriented:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/sessions` | Create an owned assistant session |
+| `GET` | `/sessions` | List sessions for the current identity, newest first |
+| `PATCH` | `/sessions/{id}` | Set or clear the session title |
+| `GET` | `/sessions/{id}` | Load session messages |
+| `POST` | `/sessions/{id}/runs` | Create a detached Run; returns `202` and `run_id` |
+| `GET` | `/runs/{id}/events/stream` | Replay and follow events from `after_seq` |
+| `POST` | `/runs/{id}/responses` | Submit pending input and resume the Run |
+
+The same Agent can also be mounted with `rungent.mcp.create_mcp_asgi` for external clients. You do
+not need a second tool catalog. See [MCP adapter](/docs/mcp).
+
+Always supply an identity resolver. A browser-supplied subject header is not authentication.
+Run creation accepts `Idempotency-Key`. A conflicting request returns
+`detail.code=active_run_conflict` with the active Run ID. Disconnecting the event stream never
+cancels execution.
+
+---
+
+# MCP adapter
+
+Mount `rungent.mcp.create_mcp_asgi` next to the product FastAPI router. The adapter invokes `@tool`
+functions directly. It does not start a Runtime session, emit ACS events, or run the model loop.
+
+```python
+from fastapi import FastAPI, Request
+
+from rungent import Identity
+from rungent.fastapi import create_router
+from rungent.mcp import create_mcp_asgi
+
+
+async def resolve_identity(request: Request) -> Identity:
+    user = await current_user(request)
+    return Identity(subject_id=user.id, tenant_id=user.tenant_id)
+
+
+app = FastAPI()
+app.include_router(
+    create_router(runtime, identity_resolver=resolve_identity),
+    prefix="/api/assistant",
+)
+app.include_router(
+    create_mcp_asgi(
+        agent,
+        identity_resolver=resolve_identity,
+        context_factory=mcp_deps,
+        resource_metadata_url="https://example.com/.well-known/oauth-protected-resource",
+    ),
+    prefix="/mcp",
+)
+```
+
+Use the same `Agent` and the same `@tool` implementations. Pass `tools=` when the external catalog
+must be a subset (hide `open_page` and every `requires_interaction_response` continuation).
+
+## Behavior
+
+| Runtime / FastAPI | MCP adapter |
+| --- | --- |
+| Model plans tool calls | The external agent plans |
+| Session + Run + ACS | One-shot `tools/call` |
+| `approval="always"` gates in ACS | Exported as annotations / `_meta.confirmation` |
+| `InteractionRequest` pauses the Run | Returned as a `missing_arguments` error |
+| `request_input` / `report_progress` | Not advertised |
+
+Unauthenticated POST `/mcp` returns `401` with
+`WWW-Authenticate: Bearer … resource_metadata="…"`. OAuth discovery and login belong to the host
+application. See [External agents](/docs/external-agents).
+
+`Agent.export_skill()` writes a SKILL.md draft from exportable tools. Rewrite the voice and auth
+steps in the host product; do not ship the in-app system prompt as a Skill.
+
+---
+
+# External agents
+
+A Rungent application can serve two consumers from one `@tool` catalog:
+
+1. The product UI, through `Runtime` and `rungent.fastapi`.
+2. A local coding agent (Claude, Cursor), through `rungent.mcp` and a Skill file.
+
+This is not a skill router and not a second agent runtime. The external model already plans. Rungent
+only exposes typed tools.
+
+## Recipe
+
+1. Keep the in-app Agent and FastAPI session API unchanged.
+2. Mount `create_mcp_asgi` at a public HTTPS path such as `/mcp`.
+3. Implement OAuth 2.1 (authorization code + PKCE) in the **host**. Return `401` + protected-resource
+   metadata from `/mcp` so the client can open a browser login. Do not give the client the first-party
+   session JWT.
+4. Publish a Skill that tells the local agent to use those MCP tools, verify the connector first, and
+   never invent REST paths. A host should serve both on one origin, for example
+   `https://<host>/mcp` and `https://<host>/skill`.
+
+Login windows come from the MCP client's OAuth flow, not from `request_input`.
+
+## Host vs Rungent
+
+| Standard in Rungent | Host application |
+| --- | --- |
+| Tool schema, effect, approval annotations | User login, consent, clients, refresh tokens |
+| Filter `requires_interaction_response` | Which tools are public |
+| Synthetic `ToolContext` on each call | `Identity` and `deps` (tokens, DB, HTTP) |
+| Skill markdown draft | Product Skill copy and connector URL |
+
+Do not wrap `Runtime.create_run` as an MCP tool. Do not put OAuth inside the Rungent package.
+
+---
+
+# Interactions and approvals
+
+## Missing information
+
+Rungent always exposes the built-in `request_input` model tool. It creates a durable `text`,
+`choice`, or `form` interaction and places the Run in `waiting_input`. A choice may set
+`multiple=true` and `allow_custom=true` independently.
+
+Text interactions submit a string. Choice interactions always submit one explicit response object:
+
+```json
+{
+  "selected": ["shibuya", "asakusa"],
+  "custom": "Kichijoji"
+}
+```
+
+For single choice, `selected` contains at most one ID and a custom answer is mutually exclusive.
+For multi-choice, selected IDs and custom text may coexist. Rungent rejects unknown IDs, duplicate
+IDs, empty answers, disallowed custom text, and multiple answers for a single-choice interaction.
+The frontend must collect multi-choice state locally and submit only when the user presses its
+explicit submit button; selecting one option must not resume the Run.
+
+Rungent adds the validated response as the result of the original `request_input` call and resumes
+the same Run. During that resumed drive, host tools also receive it as
+`ctx.interaction_response`; this trusted value includes the interaction ID and original prompt, so
+sequential workflows can prove they are consuming the current user answer rather than a value the
+model invented. A later response replaces it, and initial/approval drives expose no answer.
+
+## Tool-directed questions
+
+For deterministic business workflows, a host tool can return an `InteractionRequest` through
+`ToolResult.interaction`. The request freezes a continuation tool and validated arguments. The
+continuation must declare `requires_interaction_response=True`; Rungent invokes it directly after
+the user answers, without asking the model to recreate the question or route the answer.
+
+```python
+return ToolResult(
+    interaction=InteractionRequest(
+        kind="choice",
+        prompt="Which place did you mean?",
+        options=[{"id": "station", "label": "Kyoto Station"}],
+        allow_custom=True,
+        allow_skip=True,
+        skip_label="Skip this place",
+        continuation=ToolContinuation(
+            tool="resolve_place", arguments={"draft_id": draft.id}
+        ),
+    )
+)
+```
+
+A skipped choice submits `{selected: [], skipped: true}` and is mutually exclusive with selected
+or custom answers. Options may set `recommended=true`; clients should treat it as a presentation
+hint, not as permission to answer automatically. A continuation may return another interaction,
+creating a durable sequential workflow. Once no interaction is returned, the normal agent loop
+resumes.
+
+## Grouped questions
+
+Use one form when two to eight independent questions are already known. This reduces model turns
+and lets the user review and submit one coherent answer. Ask sequentially when a later question or
+its options depend on an earlier answer, or when one sensitive/high-effort question deserves its
+own context.
+
+```json
+{
+  "kind": "form",
+  "prompt": "Trip preferences",
+  "questions": [
+    {"id": "city", "kind": "text", "prompt": "Which city?"},
+    {
+      "id": "pace",
+      "kind": "choice",
+      "prompt": "Preferred pace?",
+      "options": [{"id": "slow", "label": "Slow"}, {"id": "fast", "label": "Fast"}]
+    }
+  ]
+}
+```
+
+The client renders every question in one card and submits once:
+
+```json
+{
+  "answers": {
+    "city": "Tokyo",
+    "pace": {"selected": ["slow"]}
+  }
+}
+```
+
+Question IDs are unique. Questions may be `text` or `choice` and may set `required=false`.
+Rungent validates every nested answer with the same rules as a standalone interaction.
+
+Rungent also exposes `report_progress(message)` for short public updates during multi-step work.
+The runtime validates its 280-character limit, records a public `activity.updated` event, and sends
+a normal tool result back to the model. Repeated host-tool updates share one stable activity ID, so
+the SDK replaces one row while persisted events retain the complete sequence. It has no business
+effect and never requires approval.
+Provider reasoning and hidden chain of thought are not progress and are never forwarded.
+Prompts should place progress calls alongside real business tool calls; a progress-only model step
+adds latency without advancing the task.
+
+Host-authored `RunActivity` covers the different case where a provider has not produced any stream
+event yet. It gives the product an immediate, factual status and Rungent refreshes that same
+persisted activity after three silent seconds and every five seconds. It must describe observable
+workflow state, not invent model reasoning.
+
+## Approval
+
+```python
+@tool(
+    effect="destructive",
+    approval="always",
+    title="Delete trip day",
+    confirmation="Delete day {day_number} and move its places to the unplanned pool?",
+)
+async def remove_day(ctx: ToolContext, day_number: int) -> ToolResult:
+    ...
+```
+
+Before execution Rungent freezes the tool name, validated arguments, call ID, and approval
+interaction. Approval executes that exact invocation. Rejection returns a structured rejection to
+the model. The model cannot silently regenerate different arguments after the user approves.
+
+Every `approval="always"` tool must declare `confirmation`. A format string receives validated,
+JSON-safe arguments. For a state-dependent impact preview, pass a sync or async callable with the
+same `ToolContext` plus tool arguments; Rungent evaluates it before persisting the approval:
+
+```python
+async def preview_clear_day(ctx: ToolContext, day_number: int) -> str:
+    names = await ctx.deps["trips"].place_names(ctx.resource["trip_id"], day_number)
+    return f"Delete all {len(names)} places from day {day_number}?\n" + "\n".join(names)
+```
+
+This is intentionally separate from asking the model to produce “Confirm / Cancel” choices.
+If argument validation or the confirmation callable fails, Rungent emits `tool.failed` and does not
+create an approval interaction.
+
+---
+
+# Persistence
+
+`MemoryStore` is for tests and local prototypes. Production applications should use
+`SQLAlchemyStore`.
+
+```python
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from rungent.sqlalchemy import RungentBase, SQLAlchemyStore
+
+store = SQLAlchemyStore(async_sessionmaker(engine, expire_on_commit=False))
+```
+
+Add `RungentBase.metadata` to the application's Alembic target metadata and generate a normal
+application migration. Rungent never runs `create_all()` during production startup.
+
+The built-in schema stores:
+
+- owned sessions, optional title, and resource scope;
+- normalized messages;
+- Run state, frozen pending interactions, and deferred host task bindings.
+- append-only public ACS events with a unique `(run_id, seq)` order.
+
+Events are persisted before they are yielded to SSE consumers. `GET /runs/{run_id}/events` supports
+`after_seq` replay for history and reconnect handling. Only public runtime events belong in this
+table: provider reasoning, prompts, dependencies, private tool data, and exception details must
+remain server-side.
+
+Tool implementations own their business transactions. Irreversible commits should be atomic.
+Reversible work may instead use a persisted deferred job with small idempotent item transactions;
+Rungent coordinates pause/resume and cancellation but never attempts an implicit rollback.
+
+---
+
+# Frontend SDK
+
+```bash
+npm install @rungent/sdk
+```
+
+```ts
+import {
+  RungentClient,
+  failRungentState,
+  initialRungentState,
+  reduceRungentEvent,
+} from '@rungent/sdk';
+
+const client = new RungentClient({ baseUrl: '/api/assistant' });
+const session = await client.createSession({ resource: { trip_id: tripId } });
+
+let state = initialRungentState;
+const run = await client.createRun(session.id, 'Move Asakusa to day 2', {
+  idempotencyKey: crypto.randomUUID(),
+});
+await client.streamRunEvents(run.run_id, state.lastSeq ?? 0, {
+  signal: abortController.signal,
+  onEvent(event) {
+    state = reduceRungentEvent(state, event);
+    render(state);
+  },
+});
+```
+
+When `state.interaction` exists, render text input, choice controls, or approval buttons according
+to its `kind`. For `choice`, use `multiple` to choose radio-like or checkbox-like controls and show
+a free-text field when `allow_custom` is true. Submit a `ChoiceResponse` object only after explicit
+multi-select confirmation:
+
+```ts
+await client.respond(runId, interaction.id, {
+  selected: ['shibuya', 'asakusa'],
+  custom: 'Kichijoji',
+});
+await client.streamRunEvents(runId, state.lastSeq ?? 0, { onEvent });
+```
+
+For `form`, render every `interaction.questions` item in one card, keep all answers locally, and
+resume only from one explicit submit button:
+
+```ts
+await client.respond(runId, interaction.id, {
+  answers: {
+    city: 'Tokyo',
+    pace: { selected: ['slow'] },
+  },
+}, { onEvent });
+```
+
+During an automatic provider retry, the reducer clears incomplete output and keeps the model
+activity running with `retry`, `maxRetries`, and `retryReason`. Render progress such as
+“Network interrupted, retrying 1/3…”; no user message is required.
+
+Use `failRungentState(state, message)` when the HTTP/SSE transport itself throws before a terminal
+event. Both it and `run.failed` settle every running model/tool/interaction activity so the UI does
+not retain stale spinners.
+
+Bounded-loop exhaustion emits `run.failed` with `code=model_step_limit_exceeded`, a safe public
+message, and `retryable=true`. The SDK exposes these as `state.errorCode` and `state.retryable` so
+products can render localized recovery guidance; the configured numeric limit remains internal.
+
+Cancel an in-flight `run` or `respond` by calling `await client.cancel(runId)`, then abort its
+supplied `AbortSignal` to close the client stream. The cancel endpoint terminates the active drive
+and persists a `run.cancelled` terminal event; using `AbortSignal` alone cannot reliably notify an
+HTTP server after the connection disappears. The reducer projects the event as
+`state.status === 'cancelled'` rather than conflating it with failure, and replay restores it.
+
+`state.activities` is an ordered union of model, progress, tool, interaction, and external-task
+activity. A deferred tool projects `state.status === 'waiting_external'`; poll persisted events with
+`listEvents(runId, state.lastSeq)` while no SSE request is open, and keep cancel available. External
+task progress updates one stable activity until completion. Progress
+activity may be `running`, `completed`, or `failed`; repeated events with the same ID update one
+timeline entry, and terminal events settle a running progress entry. Keep the
+timeline expanded while running or waiting, keep failures expanded, and collapse it only
+after `state.status === 'completed'`. This collapse preference belongs to the product UI, not the
+SDK. Tool activity exposes only safe `message` and optional `public` data; use stable tool names for
+application-specific labels and icons.
+Deduplicated non-read calls appear as completed tool activities with `deduplicated=true` and a safe
+message; they never execute host business code.
+Tool activities also expose a stable optional `code`. Product UIs should hide or localize technical
+validation failures such as `invalid_arguments` instead of rendering framework English verbatim.
+
+Persisted public events can be replayed without parsing SSE:
+
+```ts
+const events = await client.listEvents(runId, lastSeq);
+state = events.reduce(reduceRungentEvent, state);
+```
+
+Rungent intentionally ships no styled drawer, dock, or message components. Existing products keep
+their own design system while sharing the protocol client and state transition logic.
+
+---
+
+# Agent baseline testing
+
+Rungent uses two baseline layers.
+
+## Deterministic harness baseline
+
+Runs with `ScriptedModel` and must be part of normal CI. It verifies infrastructure independent of
+model quality:
+
+- schema generation and execution-time validation;
+- plain response completion;
+- multi-step tool calling;
+- text, single-choice, multi-choice, custom-choice, and grouped-form interaction pause/resume;
+- approval argument freezing, acceptance, and rejection;
+- timeout and tool error isolation;
+- equivalent successful write deduplication and explicit repeat opt-out;
+- session ownership;
+- transient model retry, retry exhaustion, and max-step termination;
+- ACS event ordering and TypeScript parsing;
+- model-step, public progress, persistence, and replay behavior;
+- SQL persistence round trips.
+
+## Application behavior baseline
+
+Use `BaselineCase` with the actual configured model in a scheduled or opt-in test job:
+
+```python
+TRIP_BASELINE = [
+    BaselineCase(
+        name="swap two known places",
+        input="Swap Asakusa Temple and Tokyo Tower",
+        expected_tools=("swap_places",),
+    ),
+    BaselineCase(
+        name="ambiguous place asks user",
+        input="Move the museum to day two",
+        expected_interactions=("choice",),
+        responses=("museum_edo",),
+        expected_tools=("move_place",),
+    ),
+    BaselineCase(
+        name="delete day requires approval",
+        input="Delete day three",
+        expected_interactions=("approval",),
+        responses=("approve",),
+        expected_tools=("remove_day",),
+    ),
+]
+
+suite = BaselineSuite(
+    runtime=runtime,
+    cases=TRIP_BASELINE,
+    identity=Identity(subject_id="baseline"),
+    resource={"trip_id": fixture_trip.id},
+    deps={"trips": fixture_trip_service},
+)
+report = await suite.run()
+report.assert_passed()
+print(f"pass rate: {report.pass_rate:.1%}")
+```
+
+Use `followups=(...)` to test multiple turns in the same session. Pass `setup_case` when every case
+needs a fresh database fixture; it returns `BaselineEnvironment(resource=..., deps=...)`.
+Use `before_all` and `after_all` for resources normally managed by application lifespan, such as
+HTTP clients used by live-model baselines.
+Application assertions should verify final database state, not only the assistant's prose.
+
+Tool and interaction sequences are exact by default, which is appropriate for `ScriptedModel` and
+strict behavior checks. For live models, set `tool_match="contains"` or
+`interaction_match="contains"` when required events must occur in order but safe retries are
+acceptable. An empty expected sequence with `contains` allows an optional branch; use a state or
+trace assertion to constrain what that branch may do. Keep final-state assertions enabled, and do
+not use `contains` to hide non-idempotent duplicate writes.
+
+Expose the suite as a module value and run the Rungent-owned CLI from the host project:
+
+```bash
+rungent baseline routers.agent.baseline:baseline_suite
+rungent baseline routers.agent.baseline:baseline_suite --case "add external place"
+```
+
+The baseline command is a developer/evaluation tool. It is intentionally not an agent-callable
+`@tool`, so the model under evaluation cannot modify its own cases or verdicts.
+
+### Minimum Roasea matrix
+
+| Capability | Required scenarios |
+| --- | --- |
+| Place editing | add, remove, move, swap, ambiguous match |
+| Day editing | add, remove with approval, invalid day |
+| Transport | each valid mode, invalid mode correction |
+| Context | short follow-up resolves against previous interaction |
+| Safety | rejection changes nothing, tool errors do not fabricate success |
+| Reliability | repeated idempotent request, grouped questions, transient retry, max-step failure |
+
+Track pass rate, unexpected tool rate, unnecessary interaction rate, and final state accuracy. Do not
+use prose similarity as the primary correctness metric.
+
+---
+
+# Roasea reference integration
+
+Roasea uses embedded mode because tools need direct access to SQLAlchemy and map services.
+The migration boundary is small:
+
+1. Convert functions in `api/services/llm/tools.py` to typed `@tool` definitions.
+2. Move the planner prompt into one `Agent`.
+3. Convert `build_snapshot()` into the Agent context provider.
+4. Mount the Rungent FastAPI router under `/api/assistant`.
+5. Create sessions with `resource={"trip_id": trip_id}`.
+6. Replace browser-provided history with Rungent-owned sessions.
+7. Use `@rungent/sdk` in `chat-panel.tsx` and revalidate Trip SWR state after `run.completed`.
+8. Add the matrix from [Agent baseline testing](/docs/baseline).
+
+`remove_place` and `remove_day` should require approval. Moving, swapping, renaming, and changing
+transport may execute directly because the UI already makes those changes reversible.
+
+Match tool granularity to the user's business action. “Change every leg to driving” should call one
+Roasea-owned batch tool that updates all valid legs in one transaction. It should not make the
+model resolve every place and issue repeated single-stop writes, and Rungent's bounded-loop limit
+should not be raised to compensate for such an undersized interface.
+
+Rungent transports and persists final assistant content as an opaque string. Roasea defines the
+Agent's Markdown writing rules and renders only assistant output with its own sanitized, streaming
+Markdown component; user-authored content remains plain text. Formatting, link policy, and visual
+styling stay outside Rungent and `@rungent/sdk`.
+
+See the scaffold in `examples/roasea/` in the repository.
+
+## Importing externally generated itineraries
+
+Treat a long import as one staged business operation, not a sequence of `add_place` calls:
+
+1. The product Agent denoises the latest user-corrected itinerary into a typed candidate.
+2. `prepare_itinerary_import` resolves places and persists an application-owned draft. It returns
+   a structured diff through `ToolResult.public` without changing the trip.
+3. The Agent uses `request_input` for unresolved places, dates, and merge conflicts, then refreshes
+   the draft with another application tool.
+4. One `approval="always"` commit tool freezes the draft ID and expected trip revision. The host
+   checks that revision and applies the whole diff in one database transaction.
+
+Rungent owns the durable clarification and approval lifecycle. Roasea owns import drafts,
+domain validation, place providers, optimistic concurrency, the diff UI, and the transaction.
+
+---
+
+# AI reference
+
+## Objective
+
+Embed Rungent into an existing Python application. Define one `Agent`, typed `@tool` functions, a
+`Runtime`, application identity/context factories, and the FastAPI router. Use `@rungent/sdk` in the
+frontend. Never implement another tool loop.
+
+## Canonical imports
+
+```python
+from rungent import (
+    Agent,
+    DeferredRequest,
+    Identity,
+    InteractionRequest,
+    Runtime,
+    RunActivity,
+    ToolContext,
+    ToolContinuation,
+    ToolResult,
+    tool,
+)
+from rungent.fastapi import create_router
+from rungent.mcp import create_mcp_asgi
+from rungent.llm import OpenAICompatibleModel
+from rungent.sqlalchemy import RungentBase, SQLAlchemyStore
+from rungent.testing import BaselineCase, BaselineSuite, ScriptedModel, run_baseline
+```
+
+## Required invariants
+
+- Tool parameter types are mandatory; the first parameter is `ToolContext`.
+- `effect` and `approval` must be explicit on every business tool.
+- `approval="always"` requires a concrete `confirmation` string or callable, then freezes and
+  gates the exact invocation. Never use a generic title as the approval prompt.
+- Use one `form` for independent, already-known questions; ask sequentially only when later
+  questions depend on earlier answers. Do not ask for approval in plain assistant text.
+- Choice interactions declare `multiple`, `allow_custom`, and safe `allow_skip`; clients submit
+  `{selected: string[], custom?: string, skipped?: boolean}` and the runtime validates it before
+  resuming.
+- Form interactions contain 1–8 typed questions; clients submit
+  `{answers: {question_id: string | ChoiceResponse}}` once.
+- `report_progress` is a reserved built-in tool for short, public updates during multi-step work.
+  It is not raw reasoning and has no business side effect.
+- Long-running host tools call `await ctx.report_progress(message, public=...)` to persist and
+  stream real application progress before the tool completes. All updates from one tool call use a
+  stable activity ID and project as one changing SDK activity while the persisted event stream
+  retains every update. The activity remains `running` until the tool succeeds or fails.
+- An Agent may declare a host-authored `run_activity(ctx, content)` provider. Rungent emits its
+  `RunActivity` immediately, then updates the same persisted running activity after three silent
+  seconds and every five seconds until the model stream advances. These are public working states,
+  never provider reasoning or hidden chain of thought.
+- `Runtime.model_step_timeout_seconds` bounds each provider attempt and
+  `model_step_total_timeout_seconds` optionally bounds the complete model step. Retries receive a
+  fresh per-attempt budget; timeout persists `run.failed` through the normal terminal path.
+- `ToolResult.data` is model-visible, `message` is safe progress text, and `public` is optional UI data.
+- `ToolResult.interaction` may contain a typed `InteractionRequest` and frozen continuation tool.
+  Rungent validates and persists it, then directly invokes the `requires_interaction_response`
+  continuation after the user answers without another model step.
+  Model-facing results have an explicit `tool_status: success|error` envelope; `data.ok=false`,
+  exceptions, timeouts, and validation errors are failures and may be retried. A failed
+  `ToolResult` may use its safe `message` as the public failure activity; exception details remain
+  private.
+- `ToolResult.deferred=DeferredRequest(...)` pauses a successful tool in `waiting_external`
+  without completing its activity or spending another model step. The host reports safe progress
+  and calls `Runtime.resume_deferred` with the authoritative terminal `ToolResult`. Rungent
+  atomically claims and leases the resumed execution before returning to the model, so recovery
+  workers cannot classify the active continuation as interrupted; task IDs are
+  bound to one Run and can be consumed once. Use `external_task_canceller` to connect Run
+  cancellation to host-owned work.
+- After a validated non-approval response, `ToolContext.interaction_response` exposes its ID, kind,
+  original prompt, and normalized value to host tools for trusted sequential workflows. Declare
+  `requires_interaction_response=True` on tools that consume it; Rungent hides those tools before a
+  real response and clears the trusted response after the first attempted consumption.
+- Equivalent successful non-read calls are deduplicated within a Run after argument normalization.
+  Use an explicit batch/count argument; set `deduplicate=False` only for genuinely repeatable writes.
+- Sessions are owned by `Identity`; identity resolution belongs to the host application.
+- `create_mcp_asgi` invokes exportable tools (`requires_interaction_response` is omitted). It does
+  not use Runtime, ACS, or `request_input`. Host code owns OAuth. `Agent.export_skill()` is a
+  markdown draft, not a router.
+- One session has at most one active Run; resume the waiting Run instead of starting another.
+- ACS `seq` is monotonic for the complete Run, including every pause/resume cycle.
+- Model step IDs and the 16-step default budget are also monotonic across pause/resume cycles;
+  provider retries do not consume additional model steps.
+- A provider completion with neither text nor tool calls is retried by the bounded harness loop;
+  it never becomes a successful empty assistant message.
+- The model transport retries timeouts, network failures, HTTP 408/429, and 5xx responses three
+  times by default. Retries stay in the same model step and emit `message.reset` plus
+  `model.retrying`; clients replace partial output and show `retry/max_retries` progress.
+- Malformed or truncated tool-argument JSON follows the same bounded retry path with reason
+  `invalid_tool_arguments`. The retry adds a compact-valid-JSON correction and cannot execute a
+  partial tool call.
+- Public ACS events are persisted before delivery. Never expose or persist provider
+  `reasoning_content`, hidden chain of thought, private tool data, or exception details.
+- Dynamic business state comes from `Agent.context`, not stale conversation prose.
+- Production uses `SQLAlchemyStore` and an application Alembic migration.
+- Frontends consume ACS through `@rungent/sdk`.
+- Terminal events settle unfinished activities; call SDK `failRungentState` for transport failures.
+- Every integration ships deterministic and real-model baseline cases.
+- `OpenAICompatibleModel(extra_body=...)` adds trusted provider-specific top-level request fields
+  and cannot override core request fields.
+
+## HTTP contract
+
+```text
+POST   /sessions
+GET    /sessions
+PATCH  /sessions/{session_id}
+GET    /sessions/{session_id}
+GET    /sessions/{session_id}/runs
+POST   /sessions/{session_id}/runs
+GET    /runs/{run_id}/events?after_seq={seq}
+GET    /runs/{run_id}/events/stream?after_seq={seq}
+POST   /runs/{run_id}/responses
+POST   /runs/{run_id}/cancel
+POST   /mcp                  # JSON-RPC initialize, tools/list, tools/call
+```
+
+## ACS envelope
+
+```json
+{
+  "v": 1,
+  "id": "evt_...",
+  "seq": 4,
+  "type": "interaction.requested",
+  "session_id": "ses_...",
+  "run_id": "run_...",
+  "created_at": "2026-08-03T00:00:00Z",
+  "data": {}
+}
+```
+
+The public lifecycle is `run.started`, optional host-authored running `activity.updated`, repeated
+`model.started` / optional model-wait `activity.updated` / optional `model.retrying` /
+`model.completed` steps, `activity.updated`, tool, interaction, and external-task events, message
+events, and a terminal `run.completed` or `run.failed`. A deferred tool emits
+`external_task.started`, `run.waiting_external`, zero or more `external_task.progress` events, then
+a trusted `external_task.completed|failed|cancelled`. Frontends render this as a work timeline and
+may collapse it after completion.
+
+Text interactions containing two or more numbered alternatives are rejected as
+`invalid_interaction`; callers must use a typed `choice` so clients can render real options and the
+standard custom-answer row. Tool activities expose their stable failure `code` to SDK consumers.
+
+`run.failed` may include a stable `code` and `retryable` flag. Bounded-loop exhaustion uses
+`model_step_limit_exceeded`; the TypeScript reducer projects these fields as `errorCode` and
+`retryable`, while the configured numeric limit remains internal.

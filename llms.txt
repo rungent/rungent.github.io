@@ -1,0 +1,25 @@
+# Rungent
+
+Typed embedded agent runtime for Python applications.
+
+## AI loading order
+
+1. Read https://rungent.github.io/llms-full.txt for complete context when possible.
+2. Read https://rungent.github.io/docs/ai-reference/ for the compact public API contract.
+3. Read https://rungent.github.io/docs/baseline/ before implementing application tools.
+
+## Documentation
+
+- [Rungent](https://rungent.github.io/markdown/index.md): A small, typed agent runtime embedded in your Python application.
+- [Architecture and trade-offs](https://rungent.github.io/markdown/architecture.md): The deliberately small boundary Rungent standardizes, and what stays in the host app.
+- [Getting started](https://rungent.github.io/markdown/getting-started.md): Install Rungent and run the smallest useful embedded agent.
+- [Python API](https://rungent.github.io/markdown/python-api.md): Agents, typed tools, model adapters, runtime context, and results.
+- [FastAPI integration](https://rungent.github.io/markdown/fastapi.md): Mount Rungent directly inside an existing FastAPI application.
+- [MCP adapter](https://rungent.github.io/markdown/mcp.md): Expose the same typed Agent tools to an external MCP client.
+- [External agents](https://rungent.github.io/markdown/external-agents.md): Standard pattern for remote MCP plus a Skill, with host-owned OAuth.
+- [Interactions and approvals](https://rungent.github.io/markdown/interactions.md): Pause, resume, and safely approve exact tool invocations.
+- [Persistence](https://rungent.github.io/markdown/persistence.md): Store sessions, messages, runs, and pending interactions in application-owned storage.
+- [Frontend SDK](https://rungent.github.io/markdown/frontend.md): Consume Rungent streams without adopting a prescribed chat interface.
+- [Agent baseline testing](https://rungent.github.io/markdown/baseline.md): Lock harness correctness and measure application behavior before release.
+- [Roasea reference integration](https://rungent.github.io/markdown/roasea.md): Embed Rungent as Roasea's only agent loop.
+- [AI reference](https://rungent.github.io/markdown/ai-reference.md): Compact, normative Rungent context for coding agents.
